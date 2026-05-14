@@ -174,26 +174,53 @@ def notify_teams(number):
 
 
 def notify_auth_number(number):
-    """Show a Windows toast notification with the MS Authenticator number."""
+    """Show a Windows toast + popup with the MS Authenticator number."""
+    # Toast using PowerShell's own registered AppID (works on Win10/11)
     try:
         script = f"""
-$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
-    [Windows.UI.Notifications.ToastTemplateType]::ToastText02)
-$xml.GetElementsByTagName('text')[0].AppendChild(
-    $xml.CreateTextNode('QA Suite RPA - MFA Required')) | Out-Null
-$xml.GetElementsByTagName('text')[1].AppendChild(
-    $xml.CreateTextNode('Tap number {number} in Microsoft Authenticator')) | Out-Null
+$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+$template = @'
+<toast duration="long">
+  <visual><binding template="ToastGeneric">
+    <text>QA Suite RPA - MFA Required</text>
+    <text>Tap  {number}  in Microsoft Authenticator</text>
+  </binding></visual>
+  <audio src="ms-winsoundevent:Notification.Looping.Alarm2" loop="false"/>
+</toast>
+'@
+$xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
+$xml.LoadXml($template)
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(
-    'QA Suite RPA').Show($toast)
+$appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
 """
         subprocess.Popen(
             ["powershell", "-WindowStyle", "Hidden", "-Command", script],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        log(f"Desktop notification sent: tap {number} in Authenticator.")
+        log(f"Toast notification sent: tap {number} in Authenticator.")
     except Exception as e:
-        log(f"Toast notification failed: {e}")
+        log(f"Toast failed: {e}")
+
+    # Guaranteed fallback: tkinter popup always visible on top
+    def _popup():
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            messagebox.showinfo(
+                "QA Suite RPA — MFA Required",
+                f"Tap number   {number}   in Microsoft Authenticator",
+                parent=root,
+            )
+            root.destroy()
+        except Exception:
+            pass
+    threading.Thread(target=_popup, daemon=True).start()
+
     notify_teams(number)
 
 
@@ -2179,40 +2206,43 @@ def scheduled_run():
 def setup_scheduler():
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.date import DateTrigger
     import pytz
 
     ist = pytz.timezone("Asia/Kolkata")
     scheduler = BackgroundScheduler(timezone=pytz.utc)
 
-    # Daily 7:00 PM IST
+    # 7:00 PM IST — Monday to Friday
     scheduler.add_job(
         scheduled_run,
-        CronTrigger(hour=19, minute=0, timezone=ist),
-        id="run_7pm_ist",
-        name="Daily 7 PM IST",
+        CronTrigger(day_of_week="mon-fri", hour=19, minute=0, timezone=ist),
+        id="run_7pm_weekdays",
+        name="Mon-Fri 7 PM IST",
         replace_existing=True,
     )
-    print("Scheduled: Daily 7:00 PM IST")
+    print("Scheduled: Mon-Fri 7:00 PM IST")
 
-    # Daily 12:00 AM IST (midnight)
+    # 2:00 AM IST — Tuesday to Saturday
     scheduler.add_job(
         scheduled_run,
-        CronTrigger(hour=0, minute=0, timezone=ist),
-        id="run_12am_ist",
-        name="Daily 12 AM IST",
+        CronTrigger(day_of_week="tue-sat", hour=2, minute=0, timezone=ist),
+        id="run_2am_weekdays",
+        name="Tue-Sat 2 AM IST",
         replace_existing=True,
     )
-    print("Scheduled: Daily 12:00 AM IST")
+    print("Scheduled: Tue-Sat 2:00 AM IST")
 
-    # Daily 2:00 AM IST
+    # One-time test run 5 minutes from now
+    from datetime import timedelta
+    run_at = datetime.utcnow() + timedelta(minutes=5)
     scheduler.add_job(
         scheduled_run,
-        CronTrigger(hour=2, minute=0, timezone=ist),
-        id="run_2am_ist",
-        name="Daily 2 AM IST",
+        DateTrigger(run_date=run_at),
+        id="test_run_5min",
+        name="Test run in 5 min",
         replace_existing=True,
     )
-    print("Scheduled: Daily 2:00 AM IST")
+    print(f"Test run scheduled at {run_at.strftime('%H:%M:%S')} UTC (5 min from now)")
 
     scheduler.start()
     return scheduler
