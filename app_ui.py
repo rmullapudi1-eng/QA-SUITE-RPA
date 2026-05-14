@@ -27,13 +27,32 @@ from datetime import date, datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 import dash
 from dash import dcc, html, dash_table, Input, Output, State, ctx, no_update, ALL
+from flask import redirect, session, request as flask_request, url_for
+from authlib.integrations.flask_client import OAuth
 
 # ── Config ──────────────────────────────────────────────────────────────
-EMAIL        = "Mrajesh5255@r1rcm.com"
-PASSWORD     = "Tevos@1111"
+_FROZEN = getattr(sys, "frozen", False)   # True when running as .exe
+
+# Credentials: env vars take priority; fall back to hardcoded for local dev.
+EMAIL    = os.environ.get("QA_EMAIL",    "" if _FROZEN else "Mrajesh5255@r1rcm.com")
+PASSWORD = os.environ.get("QA_PASSWORD", "" if _FROZEN else "Tevos@1111")
 SITE_URL     = "https://qualityauditsuite.r1rcm.com/"
-DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
-PORT         = 8052
+DOWNLOAD_DIR = os.environ.get(
+    "QA_DOWNLOAD_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads"),
+)
+PORT = int(os.environ.get("PORT", 8052))
+
+# ── GitHub OAuth config ──────────────────────────────────────────────────
+GITHUB_CLIENT_ID     = os.environ.get("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
+SECRET_KEY           = os.environ.get("SECRET_KEY", "dev-secret-change-in-prod")
+
+# ── Teams notification (optional) ───────────────────────────────────────
+# Paste your Incoming Webhook URL here to receive the MFA number in Teams.
+# Leave as "" to disable.
+# How to get it: Teams → channel (...) → Connectors → Incoming Webhook → Configure
+TEAMS_WEBHOOK_URL = ""
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -50,15 +69,16 @@ FACILITY_TARGETS = [
 ]
 
 # ── Multi-LOB config ─────────────────────────────────────────────────────
-LOB_LIST = ["CBOS AR", "CashPosting-CBOS", "Claim Processing -CBOS", "Credit Balance-CBOS"]
+LOB_LIST = ["CBOS AR", "CashPosting-CBOS", "CBOS Self-Pay", "Claim Processing -CBOS", "Credit Balance-CBOS"]
 
-# Run-All order: CashPosting first (page default), then the rest
-RUN_ALL_ORDER = ["CashPosting-CBOS", "CBOS AR", "Claim Processing -CBOS", "Credit Balance-CBOS"]
+# Run-All order: matches the dropdown order in the app
+RUN_ALL_ORDER = ["CashPosting-CBOS", "CBOS AR", "CBOS Self-Pay", "Claim Processing -CBOS", "Credit Balance-CBOS"]
 
 # Short abbreviations used in saved filenames
 LOB_ABBREV = {
     "CBOS AR":                "AR",
     "CashPosting-CBOS":       "CASH",
+    "CBOS Self-Pay":          "SELFPAY",
     "Claim Processing -CBOS": "CLAIMS",
     "Credit Balance-CBOS":    "CREDIT",
 }
@@ -67,6 +87,7 @@ LOB_ABBREV = {
 LOB_FACILITY_TARGETS = {
     "CBOS AR":                 FACILITY_TARGETS,
     "CashPosting-CBOS":        None,
+    "CBOS Self-Pay":           None,
     "Claim Processing -CBOS":  None,
     "Credit Balance-CBOS":     None,
 }
@@ -75,14 +96,16 @@ LOB_FACILITY_TARGETS = {
 LOB_SEND_EMAIL = {
     "CBOS AR":                 False,
     "CashPosting-CBOS":        True,
-    "Claim Processing -CBOS":  True,
+    "CBOS Self-Pay":           True,
+    "Claim Processing -CBOS":  False,   # no email per user request
     "Credit Balance-CBOS":     True,
 }
 
 # LOB-level email recipients for new LOBs  ← update these addresses as needed
 LOB_EMAIL_TO = {
     "CashPosting-CBOS":        ["rkumar205@r1rcm.com", "kpragada@r1rcm.com"],
-    "Claim Processing -CBOS":  ["nkumar06@r1rcm.com", "kwilson10@r1rcm.com"],
+    "CBOS Self-Pay":           ["rkumar205@r1rcm.com", "rlakshminarayan@r1rcm.com"],
+    # "Claim Processing -CBOS" intentionally omitted — no email for this LOB
     "Credit Balance-CBOS":     ["rkumar205@r1rcm.com", "rlakshminarayan@r1rcm.com"],
 }
 
@@ -119,6 +142,37 @@ def log(msg):
     print(msg, flush=True)
 
 
+def notify_teams(number):
+    """Send the MFA auth number to your Teams personal chat via Power Automate.
+
+    Flow setup:
+      1. flow.microsoft.com → New flow → "When an HTTP request is received"
+      2. Add step: "Post message in a chat or channel"
+         - Post as: Flow bot | Post in: Chat with Flow bot
+         - Recipient: Mullapudi Rajesh
+         - Message: use dynamic content → Body (or reference body/number & body/time)
+      3. Save → paste the HTTP POST URL into TEAMS_WEBHOOK_URL above.
+    """
+    if not TEAMS_WEBHOOK_URL:
+        return
+    try:
+        import urllib.request, json
+        payload = json.dumps({
+            "number": str(number),
+            "message": f"QA Suite RPA – MFA Required\nTap {number} in Microsoft Authenticator. (~2 min window)",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            TEAMS_WEBHOOK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log(f"Teams notification sent (status {resp.status}): tap {number}.")
+    except Exception as e:
+        log(f"Teams notification failed: {e}")
+
+
 def notify_auth_number(number):
     """Show a Windows toast notification with the MS Authenticator number."""
     try:
@@ -140,6 +194,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         log(f"Desktop notification sent: tap {number} in Authenticator.")
     except Exception as e:
         log(f"Toast notification failed: {e}")
+    notify_teams(number)
 
 
 # ── Report analysis ─────────────────────────────────────────────────────
@@ -309,13 +364,77 @@ FACILITY_COLORS = {
 }
 
 
-def build_email_html(analysis):
-    """Build Outlook-compatible inline-CSS HTML for the dashboard email."""
+def build_email_html(analysis, no_errors_label=None):
+    """Build Outlook-compatible inline-CSS HTML for the dashboard email.
+
+    Layout: header → top section (corrections / no-errors banner) → summary table (sorted by pending desc).
+    no_errors_label: if set, shows green banner instead of pending corrections table.
+    """
     run_time = analysis.get("run_time", "")
 
-    # ── Summary table ────────────────────────────────────────────────────
+    # ── Top section: no-errors banner OR pending corrections table ────────
+    if no_errors_label:
+        top_section = f"""
+        <div style="margin-bottom:24px;padding:20px;background:#f0faf4;border:1px solid #a9dfbf;
+                    border-radius:6px;text-align:center">
+          <div style="font-size:36px;color:#27ae60;margin-bottom:8px">&#10003;</div>
+          <h3 style="color:#27ae60;margin:0 0 8px;font-size:16px">{no_errors_label}</h3>
+          <p style="color:#555;font-size:13px;margin:0">
+            No outstanding rework items found. All audited records have corrections recorded
+            or are within quality threshold.
+          </p>
+        </div>"""
+    else:
+        pending = analysis.get("pending", [])
+        if pending:
+            pending_rows = ""
+            for r in pending:
+                hrs_color = "#c0392b" if isinstance(r["hours"], (int, float)) and r["hours"] >= 48 else "#333"
+                cmt       = r.get("aud_comment", "")
+                cmt_style = "font-size:10px;" if len(cmt) > 80 else ""
+                reb       = r.get("rebuttal", "")
+                reb_style = "font-size:10px;" if len(reb) > 80 else ""
+                pending_rows += f"""
+                <tr>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6">{r['facility'].replace('CBOS_','')}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6">{r['analyst']}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6">{r['claim']}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6;text-align:center">{r['score']}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6;text-align:center;color:{hrs_color};font-weight:{'bold' if hrs_color!='#333' else 'normal'}">{r['hours']}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6">{r.get('correction','')}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6;{reb_style}">{reb}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6;max-width:220px;word-wrap:break-word;{cmt_style}">{cmt}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6;text-align:center">{r.get('last_reb_dt','')}</td>
+                  <td style="padding:7px 10px;border:1px solid #f5c6c6;text-align:center">{r.get('last_res_dt','')}</td>
+                </tr>"""
+            top_section = f"""
+            <h3 style="color:#c0392b;font-family:Arial,sans-serif;margin:0 0 8px">
+              Pending Corrections &nbsp;<span style="font-size:13px;font-weight:normal">(score &lt; 100% &amp; no correction made)</span>
+            </h3>
+            <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;margin-bottom:24px">
+              <thead>
+                <tr style="background:#c0392b;color:white">
+                  <th style="padding:8px 10px;text-align:left">Facility</th>
+                  <th style="padding:8px 10px;text-align:left">Analyst</th>
+                  <th style="padding:8px 10px;text-align:left">Claim #</th>
+                  <th style="padding:8px 10px;text-align:center">Score</th>
+                  <th style="padding:8px 10px;text-align:center">Hrs Since Audit</th>
+                  <th style="padding:8px 10px;text-align:left">Correction Made</th>
+                  <th style="padding:8px 10px;text-align:left">Rebuttal</th>
+                  <th style="padding:8px 10px;text-align:left">Auditor Comment on Rebuttal</th>
+                  <th style="padding:8px 10px;text-align:center">Last Rebuttal Date</th>
+                  <th style="padding:8px 10px;text-align:center">Last Rebuttal Resp Date</th>
+                </tr>
+              </thead>
+              <tbody>{pending_rows}</tbody>
+            </table>"""
+        else:
+            top_section = ""
+
+    # ── Summary table — sorted by No Correction count descending ─────────
     summary_rows = ""
-    for fac, s in analysis["summary"].items():
+    sorted_summary = sorted(analysis["summary"].items(), key=lambda x: x[1]["pending"], reverse=True)
+    for fac, s in sorted_summary:
         bg    = FACILITY_COLORS.get(fac, "#2c3e50")
         if s["errors"] == 0:
             score_color = "#27ae60"
@@ -325,64 +444,17 @@ def build_email_html(analysis):
             score_color = "#e74c3c"
         summary_rows += f"""
         <tr>
-          <td style="padding:8px 12px;border:1px solid #ddd;font-weight:bold;color:{bg}">{fac.replace('CBOS_','')}</td>
+          <td style="padding:8px 12px;border:1px solid #ddd;font-weight:bold;background:{bg};color:white">{fac.replace('CBOS_','')}</td>
           <td style="padding:8px 12px;border:1px solid #ddd;text-align:center">{s['total']}</td>
+          <td style="padding:8px 12px;border:1px solid #ddd;text-align:center;font-weight:bold;color:#27ae60">{s.get('auto_accepted', 0)}</td>
           <td style="padding:8px 12px;border:1px solid #ddd;text-align:center;font-weight:bold;color:{score_color}">{s['pct']}</td>
-          <td style="padding:8px 12px;border:1px solid #ddd;text-align:center;color:{'#e74c3c' if s['errors'] else '#27ae60'}">{s['errors']}</td>
-          <td style="padding:8px 12px;border:1px solid #ddd;text-align:center;color:{'#e74c3c' if s['pending'] else '#27ae60'}">{s['pending']}</td>
+          <td style="padding:8px 12px;border:1px solid #ddd;text-align:center;font-weight:bold;color:{'#e74c3c' if s['errors'] else '#27ae60'}">{s['errors']}</td>
+          <td style="padding:8px 12px;border:1px solid #ddd;text-align:center;font-weight:bold;color:{'#e74c3c' if s['pending'] else '#27ae60'}">{s['pending']}</td>
         </tr>"""
-
-    # ── Pending corrections table ─────────────────────────────────────────
-    pending = analysis.get("pending", [])
-    if pending:
-        pending_rows = ""
-        for r in pending:
-            hrs_color  = "#c0392b" if isinstance(r["hours"], (int, float)) and r["hours"] >= 48 else "#333"
-            cmt        = r.get("aud_comment", "")
-            cmt_style  = "font-size:10px;" if len(cmt) > 80 else ""
-            reb        = r.get("rebuttal", "")
-            reb_style  = "font-size:10px;" if len(reb) > 80 else ""
-            pending_rows += f"""
-            <tr>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6">{r['facility'].replace('CBOS_','')}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6">{r['analyst']}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6">{r['claim']}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6;text-align:center">{r['score']}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6;text-align:center;color:{hrs_color};font-weight:{'bold' if hrs_color!='#333' else 'normal'}">{r['hours']}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6">{r.get('correction','')}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6;{reb_style}">{reb}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6;max-width:220px;word-wrap:break-word;{cmt_style}">{cmt}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6;text-align:center">{r.get('last_reb_dt','')}</td>
-              <td style="padding:7px 10px;border:1px solid #f5c6c6;text-align:center">{r.get('last_res_dt','')}</td>
-            </tr>"""
-        pending_section = f"""
-        <h3 style="color:#c0392b;font-family:Arial,sans-serif;margin:24px 0 8px">
-          Pending Corrections &nbsp;<span style="font-size:13px;font-weight:normal">(score &lt; 100% &amp; no correction made)</span>
-        </h3>
-        <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px">
-          <thead>
-            <tr style="background:#c0392b;color:white">
-              <th style="padding:8px 10px;text-align:left">Facility</th>
-              <th style="padding:8px 10px;text-align:left">Analyst</th>
-              <th style="padding:8px 10px;text-align:left">Claim #</th>
-              <th style="padding:8px 10px;text-align:center">Score</th>
-              <th style="padding:8px 10px;text-align:center">Hrs Since Audit</th>
-              <th style="padding:8px 10px;text-align:left">Correction Made</th>
-              <th style="padding:8px 10px;text-align:left">Rebuttal</th>
-              <th style="padding:8px 10px;text-align:left">Auditor Comment on Rebuttal</th>
-              <th style="padding:8px 10px;text-align:center">Last Rebuttal Date</th>
-              <th style="padding:8px 10px;text-align:center">Last Rebuttal Resp Date</th>
-            </tr>
-          </thead>
-          <tbody>{pending_rows}</tbody>
-        </table>"""
-    else:
-        pending_section = """<p style="font-family:Arial,sans-serif;color:#27ae60;font-weight:bold">
-          All errors have corrections recorded.</p>"""
 
     return f"""
     <html><body style="margin:0;padding:0;background:#f0f2f5">
-    <div style="max-width:820px;margin:20px auto;font-family:Arial,sans-serif">
+    <div style="max-width:860px;margin:20px auto;font-family:Arial,sans-serif">
 
       <div style="background:#2c3e50;color:white;padding:16px 22px;border-radius:8px 8px 0 0">
         <h2 style="margin:0;font-size:18px">QA Audit Quality Dashboard</h2>
@@ -391,12 +463,15 @@ def build_email_html(analysis):
 
       <div style="background:white;padding:20px 22px;border:1px solid #ddd;border-top:none">
 
+        {top_section}
+
         <h3 style="color:#2c3e50;margin:0 0 12px;font-size:14px">Quality Score Summary</h3>
         <table style="border-collapse:collapse;width:100%;font-size:13px">
           <thead>
             <tr style="background:#2c3e50;color:white">
-              <th style="padding:8px 12px;text-align:left">Facility Group</th>
+              <th style="padding:8px 12px;text-align:left">Facility</th>
               <th style="padding:8px 12px;text-align:center">Total Audits</th>
+              <th style="padding:8px 12px;text-align:center">Auto Accepted</th>
               <th style="padding:8px 12px;text-align:center">Quality Score</th>
               <th style="padding:8px 12px;text-align:center">Errors</th>
               <th style="padding:8px 12px;text-align:center">No Correction</th>
@@ -405,31 +480,6 @@ def build_email_html(analysis):
           <tbody>{summary_rows}</tbody>
         </table>
 
-        {pending_section}
-
-        <p style="font-size:11px;color:#aaa;margin-top:24px;border-top:1px solid #eee;padding-top:10px">
-          Generated automatically by QA Suite RPA &nbsp;|&nbsp; {run_time}
-        </p>
-      </div>
-    </div>
-    </body></html>"""
-
-
-def build_no_errors_email_html(run_time, label):
-    """Brief 'no outstanding errors' notification email."""
-    return f"""
-    <html><body style="margin:0;padding:0;background:#f0f2f5">
-    <div style="max-width:600px;margin:20px auto;font-family:Arial,sans-serif">
-      <div style="background:#2c3e50;color:white;padding:16px 22px;border-radius:8px 8px 0 0">
-        <h2 style="margin:0;font-size:18px">QA Audit Quality Dashboard</h2>
-        <div style="font-size:12px;opacity:.8;margin-top:4px">Report run time: {run_time}</div>
-      </div>
-      <div style="background:white;padding:24px 22px;border:1px solid #ddd;border-top:none;text-align:center">
-        <div style="font-size:48px;margin-bottom:12px">&#10003;</div>
-        <h3 style="color:#27ae60;margin:0 0 10px;font-size:18px">{label}</h3>
-        <p style="color:#555;font-size:14px;margin:0">
-          No outstanding rework items found. All audited records have corrections recorded or are within quality threshold.
-        </p>
         <p style="font-size:11px;color:#aaa;margin-top:24px;border-top:1px solid #eee;padding-top:10px">
           Generated automatically by QA Suite RPA &nbsp;|&nbsp; {run_time}
         </p>
@@ -463,19 +513,19 @@ def send_dashboard_email(analysis, lob_name="CBOS AR"):
                 mail = outlook.CreateItem(0)
                 mail.To      = recipient
                 mail.Subject = f"QA Audit — {fac.replace('CBOS_', '')} — {analysis['run_time']}"
+                fac_analysis = {
+                    "summary": {fac: s},
+                    "pending": [r for r in analysis["pending"] if r["facility"] == fac],
+                    "run_time": analysis["run_time"],
+                }
                 if s["pending"] == 0:
-                    mail.HTMLBody = build_no_errors_email_html(
-                        analysis["run_time"],
-                        f"No Outstanding Errors — {fac.replace('CBOS_', '')}"
+                    mail.HTMLBody = build_email_html(
+                        fac_analysis,
+                        no_errors_label=f"No Outstanding Errors — {fac.replace('CBOS_', '')}"
                     )
                     mail.Send()
                     log(f"No-errors email sent to {recipient} for {fac.replace('CBOS_', '')}")
                 else:
-                    fac_analysis = {
-                        "summary": {fac: s},
-                        "pending": [r for r in analysis["pending"] if r["facility"] == fac],
-                        "run_time": analysis["run_time"],
-                    }
                     mail.HTMLBody = build_email_html(fac_analysis)
                     mail.Send()
                     log(f"Email sent to {recipient} for {fac.replace('CBOS_', '')}")
@@ -490,9 +540,9 @@ def send_dashboard_email(analysis, lob_name="CBOS AR"):
             mail.To      = "; ".join(recipients)
             mail.Subject = f"QA Audit — {lob_name} — {analysis['run_time']}"
             if pending_count == 0:
-                mail.HTMLBody = build_no_errors_email_html(
-                    analysis["run_time"],
-                    f"No Outstanding Errors — {lob_name}"
+                mail.HTMLBody = build_email_html(
+                    analysis,
+                    no_errors_label=f"No Outstanding Errors — {lob_name}"
                 )
                 mail.Send()
                 log(f"No-errors email sent to {', '.join(recipients)} for {lob_name}")
@@ -817,16 +867,22 @@ def select_lob(page, lob_name):
 
     Returns True if LOB was confirmed active, False if selection failed.
     """
-    page.wait_for_timeout(800)
+    # Ensure header is in view — page may have been scrolled down during previous download
+    try:
+        page.evaluate("window.scrollTo(0, 0)")
+    except Exception:
+        pass
+    page.wait_for_timeout(600)
 
     # ── Read current LOB from header (JS read-only — safe) ───────────────────
     def current_header_lob():
         try:
             return page.evaluate("""
                 (lobKeys) => {
-                    for (const el of document.querySelectorAll('span')) {
+                    // Check span, div, button — app may use any inline element for LOB label
+                    for (const el of document.querySelectorAll('span, div, button')) {
                         const r = el.getBoundingClientRect();
-                        if (lobKeys.includes(el.textContent.trim()) && r.top < 120 && r.width > 0)
+                        if (lobKeys.includes(el.textContent.trim()) && r.top < 120 && r.top > 0 && r.width > 0)
                             return el.textContent.trim();
                     }
                     return null;
@@ -844,11 +900,11 @@ def select_lob(page, lob_name):
     # ── Get bounding boxes of the header span AND its ancestors (JS read-only) ─
     ancestor_boxes = page.evaluate("""
         (lobKeys) => {
-            // Find the LOB name span in the header band
+            // Find the LOB name element in the header band (span, div, or button)
             let sp = null;
-            for (const el of document.querySelectorAll('span')) {
+            for (const el of document.querySelectorAll('span, div, button')) {
                 const r = el.getBoundingClientRect();
-                if (lobKeys.includes(el.textContent.trim()) && r.top < 120 && r.width > 0) {
+                if (lobKeys.includes(el.textContent.trim()) && r.top < 120 && r.top > 0 && r.width > 0) {
                     sp = el; break;
                 }
             }
@@ -886,14 +942,17 @@ def select_lob(page, lob_name):
 
     # ── Baseline: count LOB-text elements already visible below the header ────
     # CRITICAL: The page body (report list, breadcrumbs, etc.) may already
-    # contain LOB names below y=100px. We must compare AGAINST this baseline —
+    # contain LOB names below y=45px. We must compare AGAINST this baseline —
     # the dropdown is only "open" when the count INCREASES beyond baseline.
+    # The header bar is ~50px tall; the trigger span sits at y≈10-40.
+    # Dropdown options render just below the header at y≈45-170, so use > 45
+    # to capture them without picking up the trigger span itself.
     _count_js = """
         (lobKeys) => {
             let n = 0;
             for (const el of document.querySelectorAll('*')) {
                 const r = el.getBoundingClientRect();
-                if (lobKeys.includes(el.textContent.trim()) && r.top > 100 && r.height > 0 && r.width > 0)
+                if (lobKeys.includes(el.textContent.trim()) && r.top > 45 && r.height > 0 && r.width > 0)
                     n++;
             }
             return n;
@@ -924,16 +983,32 @@ def select_lob(page, lob_name):
             log(f"[LOB-SEL] Level {box['level']} click error: {e}")
 
     if not opened:
-        log("[LOB-SEL] All ancestor clicks failed — saving debug snapshot.")
-        try:
-            page.screenshot(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_lob_select.png"))
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_lob_select.html"), "w", encoding="utf-8") as fh:
-                fh.write(page.content())
-            log("[LOB-SEL] Saved debug_lob_select.png / .html")
-        except Exception:
-            pass
-        log(f"WARNING: Could not open LOB dropdown for '{lob_name}'.")
-        return False
+        # ── Fallback: maybe dropdown IS open but baseline count didn't change ──
+        # Check if the target LOB option is now visible anywhere at y > 45
+        opt_visible = page.evaluate("""
+            (tgt) => {
+                for (const el of document.querySelectorAll('*')) {
+                    const r = el.getBoundingClientRect();
+                    if (el.textContent.trim() === tgt && r.top > 45 && r.height > 0 && r.width > 0)
+                        return true;
+                }
+                return false;
+            }
+        """, lob_name)
+        if opt_visible:
+            log(f"[LOB-SEL] Fallback: target option visible despite baseline detection miss — proceeding.")
+            opened = True
+        else:
+            log("[LOB-SEL] All ancestor clicks failed — saving debug snapshot.")
+            try:
+                page.screenshot(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_lob_select.png"))
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_lob_select.html"), "w", encoding="utf-8") as fh:
+                    fh.write(page.content())
+                log("[LOB-SEL] Saved debug_lob_select.png / .html")
+            except Exception:
+                pass
+            log(f"WARNING: Could not open LOB dropdown for '{lob_name}'.")
+            return False
 
     # ── Step 2: find target option — smallest bounding box wins (leaf element) ─
     # Using smallest area avoids clicking a container div that wraps the option.
@@ -942,7 +1017,7 @@ def select_lob(page, lob_name):
             const matches = [];
             for (const el of document.querySelectorAll('*')) {
                 const r = el.getBoundingClientRect();
-                if (el.textContent.trim() === tgt && r.top > 100 && r.height > 0 && r.width > 0)
+                if (el.textContent.trim() === tgt && r.top > 45 && r.height > 0 && r.width > 0)
                     matches.push({ x: r.left + r.width/2, y: r.top + r.height/2,
                                    tag: el.tagName, area: r.width * r.height });
             }
@@ -961,7 +1036,7 @@ def select_lob(page, lob_name):
     # ── Step 3: native mouse click on the target option ───────────────────────
     log(f"[LOB-SEL] Clicking option '{lob_name}' ({opt_box['tag']}, area={opt_box['area']:.0f}) at ({opt_box['x']:.0f}, {opt_box['y']:.0f})")
     page.mouse.click(opt_box['x'], opt_box['y'])
-    page.wait_for_timeout(2000)   # allow page context to switch
+    page.wait_for_timeout(1200)   # allow page context to switch
 
     new_lob = current_header_lob()
     if new_lob == lob_name:
@@ -1026,23 +1101,35 @@ def rpa_thread(today, month_start, lob_names=None):
                 return
 
             def run_one_lob(lob_name):
+                # Step 0: Navigate to home to ensure clean page state before each LOB
+                # (previous LOB's reload loop may leave the page mid-flow)
+                log(f"Navigating to home for clean state...")
+                page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30_000)
+                page.wait_for_timeout(1000)
+
                 # Step 1: Select the LOB in the global context switcher (top-of-page dropdown).
                 # This must happen BEFORE navigating to the report page so the report runs
                 # under the correct LOB's data context.
                 log(f"Selecting LOB: {lob_name}")
-                if not select_lob(page, lob_name):
+                ok = select_lob(page, lob_name)
+                if not ok:
+                    # Retry once — LOB dropdown can be flaky after page transition
+                    log(f"LOB select failed — retrying after brief pause...")
+                    page.wait_for_timeout(2000)
+                    ok = select_lob(page, lob_name)
+                if not ok:
                     log(f"ERROR: LOB switch to '{lob_name}' failed — skipping this LOB to avoid wrong-data download.")
                     return
-                page.wait_for_timeout(1500)   # allow page to stabilise after LOB switch
+                page.wait_for_timeout(1000)   # allow page to stabilise after LOB switch
 
                 # Step 2: Navigate to Reports → Audit Report within the now-selected LOB context
                 log("Reports -> Audit Report")
                 page.click("text=Reports")
-                page.wait_for_load_state("networkidle", timeout=30_000)
+                page.wait_for_load_state("domcontentloaded", timeout=30_000)
                 page.wait_for_selector("text=Audit Report", timeout=15_000)
                 page.click("text=Audit Report")
-                page.wait_for_load_state("networkidle", timeout=30_000)
-                page.wait_for_timeout(800)
+                page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                page.wait_for_timeout(600)
 
                 # Step 3: Open the report request form
                 log("Clicking Request Report...")
@@ -1202,7 +1289,7 @@ def rpa_thread(today, month_start, lob_names=None):
 
                     log("Waiting for NEW report row to appear in table...")
                     download_saved = False
-                    deadline = time.time() + 300   # 5 min total — server generation can be slow
+                    deadline = time.time() + 480   # 8 min total — server generation can be slow
 
                     def get_first_row_status(pg):
                         """Return the Status cell text of the first data row, or '' if not found."""
@@ -1224,23 +1311,23 @@ def rpa_thread(today, month_start, lob_names=None):
                         }""") or ''
 
                     # Phase 0: wait until a NEW row appears (row count increases)
-                    new_row_deadline = time.time() + 60  # give 60s for new row to appear
+                    new_row_deadline = time.time() + 120  # give 120s for new row to appear
                     while time.time() < new_row_deadline:
                         with rpa_lock:
                             if rpa["stop_requested"]:
                                 log("Stop requested — aborting.")
                                 break
                         try:
-                            page.reload(wait_until="networkidle")
-                            page.wait_for_timeout(1500)
+                            page.reload(wait_until="domcontentloaded")
+                            page.wait_for_timeout(1000)
                         except Exception:
                             pass
                         rows_now = count_table_rows(page)
                         if rows_now > rows_before:
                             log(f"New report row appeared ({rows_before} -> {rows_now}). Waiting for Completed status...")
                             break
-                        log(f"New row not yet visible (still {rows_now} rows) — retrying in 8s...")
-                        page.wait_for_timeout(8000)
+                        log(f"New row not yet visible (still {rows_now} rows) — retrying in 5s...")
+                        page.wait_for_timeout(5000)
                     else:
                         log("WARNING: New report row never appeared — may download wrong file.")
 
@@ -1258,10 +1345,10 @@ def rpa_thread(today, month_start, lob_names=None):
                             log("Report generation failed on server.")
                             break
                         else:
-                            log(f"Report status: {status_text or 'waiting...'} — checking again in 8s...")
-                            page.wait_for_timeout(8000)
-                            page.reload(wait_until="networkidle")
-                            page.wait_for_timeout(2000)
+                            log(f"Report status: {status_text or 'waiting...'} — checking again in 5s...")
+                            page.wait_for_timeout(5000)
+                            page.reload(wait_until="domcontentloaded")
+                            page.wait_for_timeout(1000)
 
                     # Phase 2: click download once Completed
                     while time.time() < deadline and not download_saved:
@@ -1317,8 +1404,8 @@ def rpa_thread(today, month_start, lob_names=None):
                                 finish_download(dl_info.value, datetime.now())
                                 download_saved = True
                             except Exception as e2:
-                                log(f"JS-dispatch also failed: {e2} — retrying in 5s...")
-                                page.wait_for_timeout(5000)
+                                log(f"JS-dispatch also failed: {e2} — retrying in 3s...")
+                                page.wait_for_timeout(3000)
 
                     if not download_saved:
                         # Save debug snapshot
@@ -1356,7 +1443,16 @@ def rpa_thread(today, month_start, lob_names=None):
                         break
                     rpa["current_lob"] = lob_name
                 log(f"[{i+1}/{len(lob_names)}] Starting LOB: {lob_name}")
-                run_one_lob(lob_name)
+                try:
+                    run_one_lob(lob_name)
+                except Exception as lob_err:
+                    log(f"ERROR in LOB '{lob_name}': {lob_err} — continuing to next LOB.")
+                    # Navigate back to home to reset page state for next LOB
+                    try:
+                        page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30_000)
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
 
             with rpa_lock:
                 rpa["status"] = "done"
@@ -1369,9 +1465,51 @@ def rpa_thread(today, month_start, lob_names=None):
             rpa["status"] = "error"
 
 
-# ── Dash layout ──────────────────────────────────────────────────────────
+# ── Dash app + GitHub OAuth ───────────────────────────────────────────────
 app = dash.Dash(__name__, title="QA Suite Report Runner",
                 suppress_callback_exceptions=True)
+
+server = app.server
+server.secret_key = SECRET_KEY
+
+oauth = OAuth(server)
+if GITHUB_CLIENT_ID:
+    oauth.register(
+        name="github",
+        client_id=GITHUB_CLIENT_ID,
+        client_secret=GITHUB_CLIENT_SECRET,
+        access_token_url="https://github.com/login/oauth/access_token",
+        authorize_url="https://github.com/login/oauth/authorize",
+        api_base_url="https://api.github.com/",
+        client_kwargs={"scope": "read:user"},
+    )
+
+    @server.route("/login")
+    def github_login():
+        cb = url_for("github_callback", _external=True)
+        return oauth.github.authorize_redirect(cb)
+
+    @server.route("/auth/callback")
+    def github_callback():
+        token = oauth.github.authorize_access_token()
+        user = oauth.github.get("user", token=token).json()
+        session["github_user"] = user.get("login", "unknown")
+        return redirect("/")
+
+    @server.route("/logout")
+    def github_logout():
+        session.clear()
+        return redirect("/login")
+
+    @server.before_request
+    def require_login():
+        exempt_prefixes = ("/login", "/auth/", "/_dash-", "/favicon", "/_reload-hash", "/assets")
+        if any(flask_request.path.startswith(p) for p in exempt_prefixes):
+            return None
+        if not session.get("github_user"):
+            return redirect("/login")
+
+# ── Dash layout ──────────────────────────────────────────────────────────
 app.layout = html.Div(style={
     "fontFamily": "Arial, sans-serif", "backgroundColor": "#f0f2f5",
     "minHeight": "100vh", "padding": "30px 0",
@@ -1392,6 +1530,48 @@ html.Div(style={"maxWidth": "820px", "margin": "0 auto", "padding": "0 20px"}, c
                                              "fontSize": "12px", "marginBottom": "6px"}),
         html.Div(id="date-display", style={"fontSize": "22px", "color": "#2c3e50",
                                             "fontWeight": "bold", "letterSpacing": "1px"}),
+    ]),
+
+    # ── Credentials panel (shown only when running as .exe) ─────────────
+    html.Div(id="cred-panel", style={
+        "display": "block" if _FROZEN else "none",
+        "background": "white", "borderRadius": "8px", "padding": "16px 20px",
+        "marginBottom": "14px", "boxShadow": "0 1px 4px rgba(0,0,0,.08)",
+        "border": "1px solid #dce1e7",
+    }, children=[
+        html.Div("Login Credentials", style={
+            "fontWeight": "bold", "color": "#555", "fontSize": "12px", "marginBottom": "12px",
+        }),
+        html.Div(style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "alignItems": "flex-end"}, children=[
+            html.Div(children=[
+                html.Label("Email", style={"fontSize": "12px", "color": "#666", "display": "block", "marginBottom": "4px"}),
+                dcc.Input(
+                    id="cred-email", type="email",
+                    placeholder="your@email.com",
+                    value="",
+                    debounce=False,
+                    style={"padding": "8px 10px", "borderRadius": "5px", "border": "1px solid #ccc",
+                           "fontSize": "13px", "width": "240px"},
+                ),
+            ]),
+            html.Div(children=[
+                html.Label("Password", style={"fontSize": "12px", "color": "#666", "display": "block", "marginBottom": "4px"}),
+                dcc.Input(
+                    id="cred-password", type="password",
+                    placeholder="Password",
+                    value="",
+                    debounce=False,
+                    style={"padding": "8px 10px", "borderRadius": "5px", "border": "1px solid #ccc",
+                           "fontSize": "13px", "width": "200px"},
+                ),
+            ]),
+            html.Button("Save", id="cred-save-btn", n_clicks=0, style={
+                "padding": "8px 22px", "backgroundColor": "#2980b9", "color": "white",
+                "border": "none", "borderRadius": "5px", "cursor": "pointer",
+                "fontSize": "13px", "fontWeight": "bold", "marginBottom": "1px",
+            }),
+            html.Span(id="cred-msg", style={"fontSize": "12px", "color": "#27ae60", "marginBottom": "2px"}),
+        ]),
     ]),
 
     # Run button + LOB selector + OTP
@@ -1592,6 +1772,23 @@ html.Div(style={"maxWidth": "820px", "margin": "0 auto", "padding": "0 20px"}, c
 # ── Callbacks ────────────────────────────────────────────────────────────
 
 @app.callback(
+    Output("cred-msg", "children"),
+    Input("cred-save-btn", "n_clicks"),
+    State("cred-email", "value"),
+    State("cred-password", "value"),
+    prevent_initial_call=True,
+)
+def save_credentials(n_clicks, email_val, password_val):
+    """Update the global EMAIL / PASSWORD used by the RPA thread."""
+    global EMAIL, PASSWORD
+    if not email_val or not password_val:
+        return "Enter both email and password."
+    EMAIL    = email_val.strip()
+    PASSWORD = password_val
+    return f"Saved — {EMAIL}"
+
+
+@app.callback(
     Output("download-pending", "data"),
     Input("download-pending-btn", "n_clicks"),
     prevent_initial_call=True,
@@ -1780,6 +1977,7 @@ CARD_COLORS = {
 LOB_TAB_COLORS = {
     "CBOS AR":                "#2c3e50",
     "CashPosting-CBOS":       "#1a6fa8",
+    "CBOS Self-Pay":          "#c0392b",
     "Claim Processing -CBOS": "#117a65",
     "Credit Balance-CBOS":    "#6c3483",
 }
@@ -2024,4 +2222,4 @@ if __name__ == "__main__":
     print(f"Starting QA Suite Report Runner...")
     print(f"Open http://localhost:{PORT} in your browser")
     scheduler = setup_scheduler()
-    app.run(debug=False, port=PORT)
+    app.run(debug=False, host="0.0.0.0", port=PORT)

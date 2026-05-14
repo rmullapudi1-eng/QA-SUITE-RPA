@@ -1,0 +1,7 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+startCommand = "python app_ui.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
